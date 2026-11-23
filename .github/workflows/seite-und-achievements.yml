@@ -1,0 +1,81 @@
+# The Elemental Saga - GitHub Pages veroeffentlichen und Achievements jede Woche auswerten.
+# Laeuft automatisch:
+#   - bei jedem Hochladen ins Repository (dann wird nur die Seite veroeffentlicht, ohne Forum-Abruf)
+#   - jeden Sonntag frueh (dann zuerst die Achievements-Auswertung, danach Veroeffentlichen)
+# Von Hand: Reiter "Actions" -> "Seite und Achievements" -> "Run workflow".
+name: Seite und Achievements
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '37 0 * * 0'   # Sonntag 00:37 UTC = 01:37 Uhr (Winter) bzw. 02:37 Uhr (Sommer) in Berlin
+  workflow_dispatch:
+    inputs:
+      achievements:
+        description: 'Achievements auswerten (falls der Wochenstand noch fehlt)'
+        type: boolean
+        default: true
+      komplett:
+        description: 'Alles neu einlesen, ohne Zwischenspeicher (nur bei Problemen)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  bauen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TZ: Europe/Berlin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.achievements)
+        with:
+          node-version: 20
+
+      - name: Achievements auswerten
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.achievements)
+        env:
+          KOMPLETT: ${{ inputs.komplett }}
+        run: |
+          npm install --no-save --no-package-lock linkedom@0.18
+          node achievements/auswertung.mjs
+
+      - name: Ergebnis im Repository speichern
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.achievements)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add achievements-data.js achievements/cache.json
+          if git diff --cached --quiet; then echo "Keine Aenderung."; else git commit -m "Achievements: Wochenauswertung" && git push; fi
+
+      - name: Seite zusammenstellen
+        run: |
+          mkdir -p _site
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'node_modules' --exclude '_site' --exclude 'achievements/' ./ _site/
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  veroeffentlichen:
+    needs: bauen
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
