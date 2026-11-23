@@ -64,8 +64,11 @@ function pageUrls(doc, href, t) {
 const MON = { jan: 0, feb: 1, 'm\u00e4r': 2, mrz: 2, mar: 2, apr: 3, mai: 4, jun: 5, jul: 6, aug: 7, sep: 8, okt: 9, nov: 10, dez: 11 };
 function parseDate(txt) {
   const now = new Date(), t = txt.replace(/\s+/g, ' ');
-  let m = t.match(/(Heute|Gestern) um (\d(?:\d)?):(\d\d)/);
+  let m = t.match(/(Heute|Gestern)\D{0,8}?(\d(?:\d)?):(\d\d)/);
   if (m) { const d = new Date(now); if (m[1] === 'Gestern') d.setDate(d.getDate() - 1); d.setHours(+m[2], +m[3], 0, 0); return d; }
+  /* Gast-Ansicht: 14.11.26 15:48 oder 14.11.2026 - 15:48 */
+  m = t.match(/(\d(?:\d)?)\.(\d(?:\d)?)\.(\d\d(?:\d\d)?)\D{1,6}?(\d(?:\d)?):(\d\d)/);
+  if (m) return new Date(m[3].length === 2 ? 2000 + +m[3] : +m[3], +m[2] - 1, +m[1], +m[4], +m[5]);
   m = t.match(/(\d(?:\d)?)\.? ([A-Za-z\u00e4\u00c4][A-Za-z\u00e4\u00c4][A-Za-z\u00e4\u00c4])[a-z\u00e4]*\.? (\d\d\d\d) - (\d(?:\d)?):(\d\d)/);
   if (m && MON[m[2].toLowerCase()] !== undefined) return new Date(+m[3], MON[m[2].toLowerCase()], +m[1], +m[4], +m[5]);
   return null;
@@ -120,9 +123,11 @@ async function auswerten() {
   const todo = [...topics].filter(([tid, t]) => !store[tid] || t.last === null || store[tid].last !== t.last || store[tid].f !== t.forum || (!store[tid].skip && store[tid].typ === undefined));
   log(topics.size + ' Themen, davon ' + todo.length + ' neu oder veraendert');
   const catId = CFG.category.replace(/-.*/, '');
+  let ohneDatum = 0, beispiel = '', leer = 0;
   for (const [tid, t] of todo) {
     const first = await get(t.href), docs = [first];
     const crumbsAll = [...first.querySelectorAll('.breadcrumb-nav a')];
+    if (!first.querySelector('div.post[id^="p"]')) { leer++; if (!beispiel) beispiel = 'Seite ohne Beitraege: ' + t.href + ' -> ' + first.body.textContent.replace(/\s+/g, ' ').trim().slice(0, 200); delete store[tid]; continue; }
     if (!crumbsAll.some(a => pfad(a.getAttribute('href')).indexOf(catId + '-') === 0)) { store[tid] = { last: t.last, f: t.forum, skip: 1 }; continue; }
     const crumbs = crumbsAll.filter(a => /^\/f/.test(pfad(a.getAttribute('href'))));
     const entry = { last: t.last, f: t.forum, nation: crumbs[0] ? crumbs[0].textContent.trim() : (forums.get(t.forum) || {}).nation, archived: crumbs.some(a => /archiv/i.test(a.textContent)) ? 1 : 0, p: [] };
@@ -136,7 +141,9 @@ async function auswerten() {
       const au = p.querySelector('.postbody p.author'); if (!au) return;
       const ua = [...au.querySelectorAll('a[href]')].filter(a => /^\/u\d/.test(pfad(a.getAttribute('href'))))[0];
       const name = (ua ? ua.textContent : au.textContent.replace(/^.*?von\s*/, '').split(/\s+(Mo|Di|Mi|Do|Fr|Sa|So|Heute|Gestern)\b/)[0]).trim();
-      const date = parseDate(au.textContent); if (!name || !date) return;
+      const date = parseDate(au.textContent);
+      if (name && !date) { ohneDatum++; if (!beispiel) beispiel = 'Datum nicht erkannt: "' + au.textContent.replace(/\s+/g, ' ').trim().slice(0, 120) + '"'; }
+      if (!name || !date) return;
       const c = p.querySelector('.content'), av = p.querySelector('.postprofile dt img'), col = ua && ua.querySelector('[style*="color"]');
       let words = 0;
       if (c) { const k = c.cloneNode(true); k.querySelectorAll('blockquote, .signature_div, .codebox').forEach(e => e.remove()); words = k.textContent.trim().split(/\s+/).filter(Boolean).length; }
@@ -152,6 +159,8 @@ async function auswerten() {
     e.p.forEach(q => q[0] < CUT && posts.push({ topic: +tid, nation: e.nation, archived: !!e.archived, typ: e.typ || '', date: new Date(q[0]), name: q[1], words: q[2], color: q[3], ava: q[4], uid: q[5] || 0 }));
   }
   const topicCount = Object.values(store).filter(e => !e.skip).length;
+  if (ohneDatum || leer) log('Hinweis: ' + ohneDatum + ' Beitraege ohne lesbares Datum, ' + leer + ' Themen ohne Beitraege. ' + beispiel);
+  if (!posts.length && topicCount) throw new Error('Keine Beitraege erkannt. ' + beispiel);
   log(posts.length + ' Beitraege, werte aus ...');
 
   // 3) Auswerten
