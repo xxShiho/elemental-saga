@@ -36,7 +36,7 @@ function saInfo(text,links){
   var nr=0,href="";
   (links||[]).some(function(h){var p=i(h),m=p.match(/^\/t(\d+)/);if(m&&+m[1]!==+e.rufpunkte&&+m[1]!==36){nr=+m[1];href=p.replace(/#.*$/,"");return!0}return!1});
   var ab=saJa(f.abbruch),ruf=!ab&&(null!=f.ruf?saJa(f.ruf):!!zl);
-  return{block:block,n:nr,href:href,titel:f.szene||"",wer:f.wer||"",was:f.was||"",abgebrochen:ab,rufpunkte:ruf,zeile:ruf?zl:"",erledigt:f.erledigt||""};
+  return{block:block,n:nr,href:href,titel:f.szene||"",wer:f.wer||"",was:f.was||"",abgebrochen:ab,rufpunkte:ruf,zeile:ruf?zl:"",erledigt:f.erledigt||(/Ins Rufbuch eingetragen/i.test(text)?"Ins Rufbuch eingetragen":"")};
 }
 function saDatum(){var d=new Date;return("0"+d.getDate()).slice(-2)+"."+("0"+(d.getMonth()+1)).slice(-2)+"."+d.getFullYear()}
 function saNr(zl,nr){if(!nr||/\(Szene \d+\)/i.test(zl))return zl;var p=zl.split("|").map(function(x){return x.trim()});if(p.length<5)return zl;p[4]=(p[4]?p[4]+" ":"")+"(Szene "+nr+")";return p.join(" | ")}
