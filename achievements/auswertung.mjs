@@ -22,7 +22,8 @@ const KOMPLETT = /^(1|true|ja)$/i.test(process.env.KOMPLETT || '');
 
 const STAT_KEYS = ['RPG-Beitr\u00e4ge', 'Treue Seele (Monate in Folge)', 'L\u00e4ngste Tagesserie', 'Mitspieler', 'Regionen', 'L\u00e4ngster Beitrag (Worte)',
   'Abgeschlossene Szenen', 'Schnelle Antworten', 'Seelenverwandte (Szenen)', 'Jahre dabei',
-  'Beitr\u00e4ge letzter Monat', 'Neue Szenen letzter Monat', 'Abgeschlossene Szenen letzter Monat', 'Beitr\u00e4ge dieser Monat'];
+  'Beitr\u00e4ge letzter Monat', 'Neue Szenen letzter Monat', 'Abgeschlossene Szenen letzter Monat', 'Beitr\u00e4ge dieser Monat',
+  'Abgeschlossene Auftr\u00e4ge', 'Krisen- und Festszenen'];
 
 /* Stichtag: der letzte Sonntag, 0:00 Uhr */
 const CUT = (() => { const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - d.getDay()); return d.getTime(); })();
@@ -116,7 +117,7 @@ async function auswerten() {
   let store = {};
   if (!KOMPLETT) { try { store = JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch (e) { store = {}; } }
   topics.forEach((t, tid) => { if (store[tid] && store[tid].f === undefined && store[tid].last === t.last) store[tid].f = t.forum; });
-  const todo = [...topics].filter(([tid, t]) => !store[tid] || t.last === null || store[tid].last !== t.last || store[tid].f !== t.forum);
+  const todo = [...topics].filter(([tid, t]) => !store[tid] || t.last === null || store[tid].last !== t.last || store[tid].f !== t.forum || (!store[tid].skip && store[tid].typ === undefined));
   log(topics.size + ' Themen, davon ' + todo.length + ' neu oder veraendert');
   const catId = CFG.category.replace(/-.*/, '');
   for (const [tid, t] of todo) {
@@ -125,6 +126,9 @@ async function auswerten() {
     if (!crumbsAll.some(a => pfad(a.getAttribute('href')).indexOf(catId + '-') === 0)) { store[tid] = { last: t.last, f: t.forum, skip: 1 }; continue; }
     const crumbs = crumbsAll.filter(a => /^\/f/.test(pfad(a.getAttribute('href'))));
     const entry = { last: t.last, f: t.forum, nation: crumbs[0] ? crumbs[0].textContent.trim() : (forums.get(t.forum) || {}).nation, archived: crumbs.some(a => /archiv/i.test(a.textContent)) ? 1 : 0, p: [] };
+    /* Art der Szene aus dem ersten Beitrag: [Auftragsszene] oder [Krisenszene] (auch Feste) */
+    const erster = first.querySelector('div.post[id^="p"] .content'), kopf = erster ? erster.textContent : '';
+    entry.typ = /\[\s*auftragsszene\s*\]/i.test(kopf) ? 'a' : /\[\s*krisenszene\s*\]/i.test(kopf) ? 'k' : '';
     for (const u of pageUrls(first, t.href, 't')) docs.push(await get(u));
     const seen = new Set();
     for (const d of docs) d.querySelectorAll('div.post[id^="p"]').forEach(p => {
@@ -145,7 +149,7 @@ async function auswerten() {
   const posts = [];
   for (const [tid, e] of Object.entries(store)) {
     if (e.skip) continue;
-    e.p.forEach(q => q[0] < CUT && posts.push({ topic: +tid, nation: e.nation, archived: !!e.archived, date: new Date(q[0]), name: q[1], words: q[2], color: q[3], ava: q[4], uid: q[5] || 0 }));
+    e.p.forEach(q => q[0] < CUT && posts.push({ topic: +tid, nation: e.nation, archived: !!e.archived, typ: e.typ || '', date: new Date(q[0]), name: q[1], words: q[2], color: q[3], ava: q[4], uid: q[5] || 0 }));
   }
   const topicCount = Object.values(store).filter(e => !e.skip).length;
   log(posts.length + ' Beitraege, werte aus ...');
@@ -185,13 +189,14 @@ async function auswerten() {
   const lastMon = monKey(monStart), thisMon = monKey(today);
   const fmtD = d => String(d.getDate()).padStart(2, '0') + '.' + String(d.getMonth() + 1).padStart(2, '0') + '.' + d.getFullYear();
   const period = monStart.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' }) + ' (' + fmtD(monStart) + ' \u2013 ' + fmtD(monEnd) + ')';
-  const doneAll = {}, quick = {}, pair = {}, byTopic = new Map();
+  const doneAll = {}, doneAuftrag = {}, doneKrise = {}, quick = {}, pair = {}, byTopic = new Map();
   posts.forEach(p => { if (!byTopic.has(p.topic)) byTopic.set(p.topic, []); byTopic.get(p.topic).push(p); });
   byTopic.forEach(list => {
     list.sort((x, y) => x.date - y.date);
     for (let i = 1; i < list.length; i++) if (list[i].name !== list[i - 1].name && list[i].date - list[i - 1].date <= 864e5) quick[list[i].name] = (quick[list[i].name] || 0) + 1;
     const who = [...new Set(list.map(p => p.name))];
     if (list[0].archived) who.forEach(n => doneAll[n] = (doneAll[n] || 0) + 1);
+    if (list[0].archived && list[0].typ) { const z = list[0].typ === 'a' ? doneAuftrag : doneKrise; who.forEach(n => z[n] = (z[n] || 0) + 1); }
     who.forEach(x => who.forEach(y => { if (x !== y) { pair[x] = pair[x] || {}; pair[x][y] = (pair[x][y] || 0) + 1; } }));
   });
   const firstPost = {};
@@ -212,20 +217,21 @@ async function auswerten() {
       'Treue Seele (Monate in Folge)': runs(new Set([...u.months].filter(m => m !== thisMon)), nextMon),
       Mitspieler: partners.size, Regionen: u.nations.size, 'L\u00e4ngster Beitrag (Worte)': u.maxWords || 0,
       'Abgeschlossene Szenen': doneAll[u.name] || 0, 'Schnelle Antworten': quick[u.name] || 0,
-      'Seelenverwandte (Szenen)': Math.max(0, ...Object.values(pair[u.name] || {})), 'Jahre dabei': years(u.name)
+      'Seelenverwandte (Szenen)': Math.max(0, ...Object.values(pair[u.name] || {})), 'Jahre dabei': years(u.name),
+      'Abgeschlossene Auftr\u00e4ge': doneAuftrag[u.name] || 0, 'Krisen- und Festszenen': doneKrise[u.name] || 0
     };
     r._u = u;
     return r;
   }).sort((a, b) => b['RPG-Beitr\u00e4ge'] - a['RPG-Beitr\u00e4ge']);
   return {
     store,
-    m: { v: 1, t: CUT, period, info: posts.length + ' Beitr\u00e4ge in ' + topicCount + (topicCount === 1 ? ' Thema' : ' Themen'),
+    m: { v: 2, t: CUT, period, info: posts.length + ' Beitr\u00e4ge in ' + topicCount + (topicCount === 1 ? ' Thema' : ' Themen'),
       u: rows.map(r => [r.Name, r._u.color || '', r._u.ava || ''].concat(STAT_KEYS.map(k => r[k]), [r._u.uid || 0])) }
   };
 }
 
 const alt = altesErgebnis();
-if (alt && alt.t === CUT && !KOMPLETT) { log('Der Stand vom ' + new Date(CUT).toLocaleDateString('de-DE') + ' ist schon da. Nichts zu tun.'); process.exit(0); }
+if (alt && alt.v === 2 && alt.t === CUT && !KOMPLETT) { log('Der Stand vom ' + new Date(CUT).toLocaleDateString('de-DE') + ' ist schon da. Nichts zu tun.'); process.exit(0); }
 const { store, m } = await auswerten();
 if (!m.u.length && alt && alt.u && alt.u.length) throw new Error('Die Auswertung ergab keine Beitraege. Alter Stand bleibt stehen.');
 fs.writeFileSync(CACHE, JSON.stringify(store));
