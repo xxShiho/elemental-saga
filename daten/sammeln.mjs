@@ -26,6 +26,7 @@ const CFG = {
   ohneTitel: /^\s*(alles\s+(\u00fc|ue)ber\b|wichtig\s*:|ank(\u00fc|ue)ndigung\s*:|\[(npc|auftrag|vorschlag)\])/i,
   archiv: /archiv/i,                    // Foren mit diesem Wort im Namen gelten als Szenenarchiv (Unterforen ebenso)
   woerter: 200,                         // Beitraege zaehlen erst ab so vielen Woertern (wie TES_GEMEINSAM.szenen.woerter)
+  keinAutor: /^(gesponserte inhalte|sponsored content|werbung|anzeige)$/i,   // Werbung in der Gastansicht ist kein Beitrag
   strukturStunden: 24,                  // so oft wird die Liste der Foren neu gelesen
   delay: +(process.env.PAUSE || 600)    // Pause zwischen Seitenabrufen (ms), schont das Forum
 };
@@ -81,8 +82,10 @@ function autor(p) {
   let a = [...p.querySelectorAll('.postbody p.author a[href*="/u"]')].find(x => x.textContent.trim());
   if (!a) a = [...p.querySelectorAll('.postprofile a[href*="/u"]')].find(x => x.textContent.trim());
   if (a) return a.textContent.trim();
-  const au = p.querySelector('.postbody p.author');   /* Gastansicht ohne Profillink */
-  return au ? au.textContent.replace(/^.*?von\s*/, '').split(/\s+(Mo|Di|Mi|Do|Fr|Sa|So|Heute|Gestern|\d)/)[0].trim() : '';
+  const au = p.querySelector('.postbody p.author');   /* Gastansicht ohne Profillink: Name steht zwischen "von" und dem Datum */
+  const name = au ? au.textContent.replace(/\u00a0/g, ' ').replace(/^.*?von\s*/, '')
+    .split(/\s+(?:(?:Mo|Di|Mi|Do|Fr|Sa|So|Heute|Gestern)\b|\d{1,2}\.\d{1,2}\.\d{2,4}|\d{1,2}\.?\s+[A-Za-z\u00e4\u00c4]{3}[a-z\u00e4]*\.?\s+\d{4})/)[0].trim() : '';
+  return CFG.keinAutor.test(name) ? '' : name;
 }
 function zaehlen(docs) {
   const out = {}, seen = new Set();
@@ -134,8 +137,8 @@ async function struktur(cache) {
 async function sammeln() {
   let cache = {};
   if (!KOMPLETT) { try { cache = JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch (e) { cache = {}; } }
-  if (cache.w !== CFG.woerter) cache.themen = {};   /* andere Wortgrenze: alles neu zaehlen */
-  cache.w = CFG.woerter; cache.themen = cache.themen || {};
+  if (cache.w !== CFG.woerter || cache.v !== 2) cache.themen = {};   /* andere Wortgrenze oder neue Zaehlweise: alles neu zaehlen */
+  cache.w = CFG.woerter; cache.v = 2; cache.themen = cache.themen || {};
   const foren = await struktur(cache);
   const archivForen = Object.values(foren).filter(f => f.archiv);
   log(Object.keys(foren).length + ' Foren, davon ' + archivForen.length + ' Szenenarchive');
