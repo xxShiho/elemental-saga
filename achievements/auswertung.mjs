@@ -120,7 +120,7 @@ async function auswerten() {
   let store = {};
   if (!KOMPLETT) { try { store = JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch (e) { store = {}; } }
   topics.forEach((t, tid) => { if (store[tid] && store[tid].f === undefined && store[tid].last === t.last) store[tid].f = t.forum; });
-  const todo = [...topics].filter(([tid, t]) => !store[tid] || t.last === null || store[tid].last !== t.last || store[tid].f !== t.forum || (!store[tid].skip && store[tid].typ === undefined));
+  const todo = [...topics].filter(([tid, t]) => !store[tid] || (!store[tid].skip && store[tid].nv !== 2) || t.last === null || store[tid].last !== t.last || store[tid].f !== t.forum || (!store[tid].skip && store[tid].typ === undefined));
   log(topics.size + ' Themen, davon ' + todo.length + ' neu oder veraendert');
   const catId = CFG.category.replace(/-.*/, '');
   let ohneDatum = 0, beispiel = '', leer = 0;
@@ -130,7 +130,7 @@ async function auswerten() {
     if (!first.querySelector('div.post[id^="p"]')) { leer++; if (!beispiel) beispiel = 'Seite ohne Beitraege: ' + t.href + ' -> ' + first.body.textContent.replace(/\s+/g, ' ').trim().slice(0, 200); delete store[tid]; continue; }
     if (!crumbsAll.some(a => pfad(a.getAttribute('href')).indexOf(catId + '-') === 0)) { store[tid] = { last: t.last, f: t.forum, skip: 1 }; continue; }
     const crumbs = crumbsAll.filter(a => /^\/f/.test(pfad(a.getAttribute('href'))));
-    const entry = { last: t.last, f: t.forum, nation: crumbs[0] ? crumbs[0].textContent.trim() : (forums.get(t.forum) || {}).nation, archived: crumbs.some(a => /archiv/i.test(a.textContent)) ? 1 : 0, p: [] };
+    const entry = { nv: 2, last: t.last, f: t.forum, nation: crumbs[0] ? crumbs[0].textContent.trim() : (forums.get(t.forum) || {}).nation, archived: crumbs.some(a => /archiv/i.test(a.textContent)) ? 1 : 0, p: [] };
     /* Art der Szene aus dem ersten Beitrag: [Auftragsszene] oder [Krisenszene] (auch Feste) */
     const erster = first.querySelector('div.post[id^="p"] .content'), kopf = erster ? erster.textContent : '';
     entry.typ = /\[\s*auftragsszene\s*\]/i.test(kopf) ? 'a' : /\[\s*krisenszene\s*\]/i.test(kopf) ? 'k' : '';
@@ -140,7 +140,10 @@ async function auswerten() {
       if (seen.has(p.id)) return; seen.add(p.id);
       const au = p.querySelector('.postbody p.author'); if (!au) return;
       const ua = [...au.querySelectorAll('a[href]')].filter(a => /^\/u\d/.test(pfad(a.getAttribute('href'))))[0];
-      const name = (ua ? ua.textContent : au.textContent.replace(/^.*?von\s*/, '').split(/\s+(Mo|Di|Mi|Do|Fr|Sa|So|Heute|Gestern)\b/)[0]).trim();
+      /* Gastansicht: Name ohne Profillink, zwischen "von" und dem Datum (z. B. "von Testkonto 1 14.11.26 15:48") */
+      const name0 = (ua ? ua.textContent : au.textContent.replace(/\u00a0/g, ' ').replace(/^.*?von\s*/, '')
+        .split(/\s+(?:(?:Mo|Di|Mi|Do|Fr|Sa|So|Heute|Gestern)\b|\d{1,2}\.\d{1,2}\.\d{2,4}|\d{1,2}\.?\s+[A-Za-z\u00e4\u00c4]{3}[a-z\u00e4]*\.?\s+\d{4})/)[0]).trim();
+      const name = /^(gesponserte inhalte|sponsored content|werbung|anzeige)$/i.test(name0) ? '' : name0;   /* Werbung in der Gastansicht */
       const date = parseDate(au.textContent);
       if (name && !date) { ohneDatum++; if (!beispiel) beispiel = 'Datum nicht erkannt: "' + au.textContent.replace(/\s+/g, ' ').trim().slice(0, 120) + '"'; }
       if (!name || !date) return;
@@ -153,10 +156,31 @@ async function auswerten() {
     store[tid] = entry;
   }
   Object.keys(store).forEach(tid => { if (!topics.has(+tid)) delete store[tid]; });
+  /* Die Gastansicht zeigt Namen ohne Gruppenfarbe und Profillink: beides aus der Mitgliederliste und der Startseite holen */
+  const mitglieder = {};
+  const ernten = d => d.querySelectorAll('a[href]').forEach(a => {
+    const m = pfad(a.getAttribute('href')).match(/^\/u(\d+)$/), n = a.textContent.trim(); if (!m || !n || mitglieder[n]) return;
+    const el = a.querySelector('[style*="color"]') || ((a.getAttribute('style') || '').indexOf('color') > -1 ? a : null);
+    mitglieder[n] = { c: farbe(el), uid: +m[1] };
+  });
+  try { ernten(await get('/')); } catch (e) { log('Startseite nicht lesbar: ' + e.message); }
+  for (let s0 = 0; s0 < 1000; s0 += 50) {
+    let d; try { d = await get('/memberlist?mode=username&order=ASC' + (s0 ? '&start=' + s0 : '')); } catch (e) { log('Mitgliederliste nicht lesbar: ' + e.message); break; }
+    ernten(d);
+    if (!d.querySelector('a[href*="start=' + (s0 + 50) + '"]')) break;
+  }
+  /* Notloesung, falls die Mitgliederliste fuer Gaeste gesperrt ist: die Nationsgruppen selbst (Gruppe -> Farbe) */
+  const GRUPPEN = { 4: 'rgb(247, 185, 85)', 5: 'rgb(9, 125, 255)', 6: 'rgb(255, 76, 76)', 7: 'rgb(47, 214, 119)' };
+  const ohneFarbe = new Set(Object.values(store).flatMap(e => (e.p || []).filter(q => !q[3] && !(mitglieder[q[1]] || {}).c).map(q => q[1])));
+  if (ohneFarbe.size) for (const [g, c] of Object.entries(GRUPPEN)) {
+    let d; try { d = await get('/g' + g + '-'); } catch (e) { continue; }
+    d.querySelectorAll('a[href]').forEach(a => { const m = pfad(a.getAttribute('href')).match(/^\/u(\d+)$/), n = a.textContent.trim(); if (m && n && !(mitglieder[n] || {}).c) mitglieder[n] = { c, uid: +m[1] }; });
+  }
+  log(Object.keys(mitglieder).length + ' Mitglieder mit Profil gefunden, ' + Object.values(mitglieder).filter(x => x.c).length + ' davon mit Gruppenfarbe');
   const posts = [];
   for (const [tid, e] of Object.entries(store)) {
     if (e.skip) continue;
-    e.p.forEach(q => q[0] < CUT && posts.push({ topic: +tid, nation: e.nation, archived: !!e.archived, typ: e.typ || '', date: new Date(q[0]), name: q[1], words: q[2], color: q[3], ava: q[4], uid: q[5] || 0 }));
+    e.p.forEach(q => { const mg = mitglieder[q[1]] || {}; if (q[0] < CUT) posts.push({ topic: +tid, nation: e.nation, archived: !!e.archived, typ: e.typ || '', date: new Date(q[0]), name: q[1], words: q[2], color: q[3] || mg.c || '', ava: q[4], uid: q[5] || mg.uid || 0 }); });
   }
   const topicCount = Object.values(store).filter(e => !e.skip).length;
   if (ohneDatum || leer) log('Hinweis: ' + ohneDatum + ' Beitraege ohne lesbares Datum, ' + leer + ' Themen ohne Beitraege. ' + beispiel);
