@@ -1,0 +1,77 @@
+# The Elemental Saga - Forumdaten jede Stunde einsammeln und veroeffentlichen.
+# Liest wie ein Gast das Szenenarchiv, die Beitraege in archivierten Szenen und die Liste der Trainingsbuecher
+# und schreibt forum-daten.js. Die Scripts im Forum lesen diese Datei statt das Forum selbst abzusuchen.
+# Von Hand starten: Reiter "Actions" -> "Forumdaten" -> "Run workflow".
+name: Forumdaten
+
+on:
+  schedule:
+    - cron: '17 * * * *'   # jede Stunde zur Minute 17
+  workflow_dispatch:
+    inputs:
+      komplett:
+        description: 'Alles neu einlesen, ohne Zwischenspeicher (nur bei Problemen)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  bauen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      TZ: Europe/Berlin
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Forumdaten einsammeln
+        env:
+          KOMPLETT: ${{ inputs.komplett }}
+        run: |
+          npm install --no-save --no-package-lock linkedom@0.18
+          node daten/sammeln.mjs
+
+      - name: Ergebnis im Repository speichern
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add forum-daten.js daten/cache.json
+          if git diff --cached --quiet; then echo "Keine Aenderung."; exit 0; fi
+          git commit -m "Forumdaten: stuendliche Aktualisierung"
+          for versuch in 1 2 3; do
+            git pull --rebase origin main && git push && exit 0
+            sleep 10
+          done
+          exit 1
+
+      - name: Seite zusammenstellen
+        run: |
+          mkdir -p _site
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'node_modules' --exclude '_site' --exclude 'achievements/' --exclude 'daten/' ./ _site/
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  veroeffentlichen:
+    needs: bauen
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
