@@ -2,6 +2,8 @@
    Liest wie ein Gast:
      - welche Szenen im Szenenarchiv liegen (alle Foren mit "Archiv" im Namen im RPG-Bereich, samt Unterforen)
      - wie viele Beitraege jede Person in jeder archivierten Szene geschrieben hat (ab der Wortgrenze)
+     - alle Szenen im RPG-Bereich mit Ort und Mitspielenden (fuer die Charakterchronik)
+     - die Zeilen des Rufbuchs (t36)
      - die Liste der Trainingsbuecher
    und schreibt forum-daten.js. Die Scripts im Forum lesen diese eine Datei, statt das Forum selbst abzusuchen.
    Archivierte Szenen werden nur einmal gezaehlt (bzw. erneut, wenn dort ein Beitrag dazukommt), der Rest kommt aus daten/cache.json.
@@ -16,6 +18,12 @@ const CFG = {
   base: process.env.FORUM || 'https://the-elemental-saga.forumieren.de',
   category: '/c3-rpg-bereich',          // RPG-Bereich: dort liegen die Szenenarchive
   buecher: '/f54-trainingsbucher',      // Trainingsbuecher
+  rufbuch: '/t36-rpg-gesellschaftliche-stimmung',   // Thema mit dem Rufbuch
+  rufMarker: /\u2726\s*RUFBUCH\s*\u2726/i,          // Beitraege mit diesem Zeichen enthalten Rufbuch-Zeilen
+  /* keine Szenen (wie in der Charakterchronik): Foren und Infothemen */
+  ohneForen: [54, 63, 58, 57, 6],
+  ohneForenName: /trainingsb|chronik|auftr(\u00e4|ae)ge|weltgeschehen|abwesen/i,
+  ohneTitel: /^\s*(alles\s+(\u00fc|ue)ber\b|wichtig\s*:|ank(\u00fc|ue)ndigung\s*:|\[(npc|auftrag|vorschlag)\])/i,
   archiv: /archiv/i,                    // Foren mit diesem Wort im Namen gelten als Szenenarchiv (Unterforen ebenso)
   woerter: 200,                         // Beitraege zaehlen erst ab so vielen Woertern (wie TES_GEMEINSAM.szenen.woerter)
   strukturStunden: 24,                  // so oft wird die Liste der Foren neu gelesen
@@ -96,26 +104,30 @@ function themenAuf(d, ziel) {
     let last = null;
     if (row) row.querySelectorAll('a[href*="#"]').forEach(l => { const m = pfad(l.getAttribute('href')).match(new RegExp('^/t' + tid + '\\D.*#(\\d+)$')); if (m) last = Math.max(last || 0, +m[1]); });
     const ua = row ? row.querySelector('a[href*="/u"]') : null, um = ua ? pfad(ua.getAttribute('href')).match(/^\/u(\d+)/) : null;
-    ziel.set(tid, { href: href.replace(/#.*$/, ''), title: a.textContent.trim(), last, uid: um ? um[1] : '' });
+    ziel.set(tid, { href: href.replace(/#.*$/, ''), title: a.textContent.trim(), last, uid: um ? um[1] : '', fest: /announce|sticky|global/i.test((row && row.className) || '') });
   });
 }
 
 async function struktur(cache) {
-  if (!KOMPLETT && cache.struktur && Date.now() - cache.struktur.at < CFG.strukturStunden * 36e5) return cache.struktur.foren;
+  if (!KOMPLETT && cache.struktur && cache.struktur.v === 2 && Date.now() - cache.struktur.at < CFG.strukturStunden * 36e5) return cache.struktur.foren;
   log('Lese die Liste der Foren ...');
   const cat = await get(CFG.category);
-  const queue = [...cat.querySelectorAll('#page-body a.forumtitle, #page-body a.forumtitleUF')].map(a => ({ href: pfad(a.getAttribute('href')), name: a.textContent.trim(), archiv: false }));
+  const queue = [...cat.querySelectorAll('#page-body a.forumtitle, #page-body a.forumtitleUF')].map(a => ({ href: pfad(a.getAttribute('href')), name: a.textContent.trim(), archiv: false, ort: '' }));
   if (!queue.length) throw new Error('Auf der Kategorieseite wurden keine Foren gefunden. Hat Forumieren den Abruf blockiert?');
   const foren = {};
   while (queue.length) {
     const f = queue.shift(), fid = idOf(f.href, 'f');
     if (!fid || foren[fid]) continue;
     f.archiv = f.archiv || CFG.archiv.test(f.name);
+    /* Ort einer Szene: der Name des Forums, bei Archiven der Ort darueber (wie in der Charakterchronik) */
+    if (!CFG.archiv.test(f.name)) f.ort = f.name;
+    else if (!f.ort) f.ort = f.name.replace(/^(szenen)?archiv\s*[:\-\u2013]?\s*/i, '') || f.name;
+    f.ohne = CFG.ohneForen.includes(fid) || CFG.ohneForenName.test(f.name);
     foren[fid] = f;
     const d = await get(f.href);
-    d.querySelectorAll('ul.forumsUF a.forumtitleUF, ul.forums a.forumtitle').forEach(a => queue.push({ href: pfad(a.getAttribute('href')), name: a.textContent.trim(), archiv: f.archiv }));
+    d.querySelectorAll('ul.forumsUF a.forumtitleUF, ul.forums a.forumtitle').forEach(a => queue.push({ href: pfad(a.getAttribute('href')), name: a.textContent.trim(), archiv: f.archiv, ort: f.ort }));
   }
-  cache.struktur = { at: Date.now(), foren };
+  cache.struktur = { v: 2, at: Date.now(), foren };
   return foren;
 }
 
@@ -128,19 +140,43 @@ async function sammeln() {
   const archivForen = Object.values(foren).filter(f => f.archiv);
   log(Object.keys(foren).length + ' Foren, davon ' + archivForen.length + ' Szenenarchive');
 
-  // 1) Szenen in den Archiven
-  const themen = new Map();
-  for (const f of archivForen) for (const d of await alleSeiten(f.href, 'f')) themenAuf(d, themen);
-  if (!themen.size && Object.keys(cache.themen).length > 5) throw new Error('In den Archiven wurden keine Szenen gefunden, vorher waren es ' + Object.keys(cache.themen).length + '. Alter Stand bleibt stehen.');
+  // 1) Alle Themen im RPG-Bereich (Archive und laufende Szenen)
+  const themen = new Map(), archivIds = new Set();
+  for (const [fid, f] of Object.entries(foren)) {
+    if (f.ohne && !f.archiv) continue;
+    const hier = new Map();
+    for (const d of await alleSeiten(f.href, 'f')) themenAuf(d, hier);
+    hier.forEach((t, tid) => { if (themen.has(tid)) return; t.forum = +fid; t.archiv = f.archiv; t.ort = f.ort; themen.set(tid, t); if (f.archiv) archivIds.add(tid); });
+  }
+  const vorher = Object.keys(cache.themen).filter(tid => cache.themen[tid].ar).length;
+  if (!archivIds.size && vorher > 5) throw new Error('In den Archiven wurden keine Szenen gefunden, vorher waren es ' + vorher + '. Alter Stand bleibt stehen.');
+  /* Infothemen und angepinnte Themen sind keine Szenen; im Archiv zaehlt trotzdem alles (fuer die Beitragszahlen) */
+  const szene = t => !t.fest && !CFG.ohneTitel.test(t.title);
+  const lesen = [...themen].filter(([tid, t]) => t.archiv || szene(t));
 
-  // 2) Beitraege zaehlen: nur neue oder veraenderte Szenen
-  const todo = [...themen].filter(([tid, t]) => { const c = cache.themen[tid]; return !c || t.last === null || c.last !== t.last; });
-  log(themen.size + ' archivierte Szenen, davon ' + todo.length + ' neu oder veraendert');
+  // 2) Beitraege zaehlen: nur neue oder veraenderte Themen
+  const todo = lesen.filter(([tid, t]) => { const c = cache.themen[tid]; return !c || t.last === null || c.last !== t.last; });
+  log(themen.size + ' Themen im RPG-Bereich, davon ' + archivIds.size + ' im Archiv; ' + todo.length + ' neu oder veraendert');
   for (const [tid, t] of todo) {
     try { cache.themen[tid] = { last: t.last, p: zaehlen(await alleSeiten(t.href, 't')) }; }
-    catch (e) { log('Szene ' + tid + ' nicht lesbar: ' + e.message); }
+    catch (e) { log('Thema ' + tid + ' nicht lesbar: ' + e.message); }
   }
-  Object.keys(cache.themen).forEach(tid => { if (!themen.has(+tid)) delete cache.themen[tid]; });
+  const behalten = new Set(lesen.map(([tid]) => String(tid)));
+  Object.keys(cache.themen).forEach(tid => { if (!behalten.has(tid)) delete cache.themen[tid]; else cache.themen[tid].ar = archivIds.has(+tid) ? 1 : 0; });
+
+  // Rufbuch: alle Zeilen mit Datum aus Beitraegen mit dem Rufbuch-Zeichen (1 = Beitrag vom Ersteller des Themas)
+  const ruf = [];
+  let starter = '';
+  for (const d of await alleSeiten(CFG.rufbuch, 't')) d.querySelectorAll('div[id^="p"]').forEach(p => {
+    if (!/^p\d+$/.test(p.id)) return;
+    const c = p.querySelector('.postbody .content') || p.querySelector('.content'); if (!c) return;
+    const wer = autor(p); if (!starter) starter = wer;
+    const tmp = parseHTML('<div>' + c.innerHTML.replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li|tr)>/gi, '\n') + '</div>').document;
+    const text = (tmp.documentElement.textContent || tmp.body.textContent || '').replace(/\u00a0/g, ' ').replace(/\r/g, '');
+    if (!CFG.rufMarker.test(text)) return;
+    text.split('\n').forEach(z => { if (/^\s*\d{1,2}\.\d{1,2}\.\d{2,4}\s*\|/.test(z)) ruf.push([z.trim(), wer === starter ? 1 : 0]); });
+  });
+  if (!ruf.length) log('Hinweis: Im Rufbuch wurden keine Zeilen gefunden.');
 
   // 3) Trainingsbuecher
   const buecher = new Map();
@@ -148,8 +184,12 @@ async function sammeln() {
 
   const daten = {
     v: 1, stand: Date.now(), w: CFG.woerter,
-    archiv: [...themen.keys()].sort((a, b) => a - b),
-    zaehl: Object.fromEntries(Object.entries(cache.themen).map(([tid, c]) => [tid, c.p])),
+    archiv: [...archivIds].sort((a, b) => a - b),
+    zaehl: Object.fromEntries(Object.entries(cache.themen).filter(([tid]) => archivIds.has(+tid)).map(([tid, c]) => [tid, c.p])),
+    /* Szenen fuer die Charakterchronik: [Nummer, Titel, Ort, archiviert, letzter Beitrag, [Mitspielende]] */
+    szenen: lesen.filter(([tid, t]) => szene(t) && !(foren[t.forum] || {}).ohne).map(([tid, t]) => [tid, t.title, t.ort || '', t.archiv ? 1 : 0, t.last || 0,
+      Object.values((cache.themen[tid] || {}).p || {}).map(x => x[0])]).sort((a, b) => b[4] - a[4]),
+    ruf,
     buecher: [...buecher.values()].map(b => [b.href, b.title, b.uid])
   };
   return { cache, daten };
@@ -160,4 +200,4 @@ fs.writeFileSync(CACHE, JSON.stringify(cache));
 const json = JSON.stringify(daten).replace(/</g, '\\u003c').replace(/[\u007f-\uffff]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 fs.writeFileSync(OUT, '/* Automatisch erzeugt (GitHub Actions, stuendlich). Stand: ' + new Date(daten.stand).toLocaleString('de-DE') + '. Nicht von Hand bearbeiten. */\n'
   + '(function (d) { var o = window.TES_FORUMDATEN; if (!o || !o.stand || d.stand >= o.stand) window.TES_FORUMDATEN = d; })(' + json + ');\n');
-log('Fertig: ' + daten.archiv.length + ' archivierte Szenen, ' + daten.buecher.length + ' Trainingsbuecher, ' + abrufe + ' Seitenabrufe.');
+log('Fertig: ' + daten.archiv.length + ' archivierte Szenen, ' + daten.szenen.length + ' Szenen insgesamt, ' + daten.ruf.length + ' Rufbuch-Zeilen, ' + daten.buecher.length + ' Trainingsbuecher, ' + abrufe + ' Seitenabrufe.');
