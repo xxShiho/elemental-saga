@@ -48,7 +48,7 @@ async function get(url) {
       const r = await fetch(CFG.base + pfad(url), { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'Accept-Language': 'de-DE,de;q=0.9' }, redirect: 'follow' });
       abrufe++;
       if (r.ok) return parseHTML(await r.text()).document;
-      fehler = new Error(url + ' -> HTTP ' + r.status);
+      fehler = new Error(url + ' -> HTTP ' + r.status); fehler.status = r.status;
       if (r.status === 404) break;
     } catch (e) { fehler = e; }
   }
@@ -111,8 +111,8 @@ function themenAuf(d, ziel) {
   });
 }
 
-async function struktur(cache) {
-  if (!KOMPLETT && cache.struktur && cache.struktur.v === 2 && Date.now() - cache.struktur.at < CFG.strukturStunden * 36e5) return cache.struktur.foren;
+async function struktur(cache, neu) {
+  if (!neu && !KOMPLETT && cache.struktur && cache.struktur.v === 2 && Date.now() - cache.struktur.at < CFG.strukturStunden * 36e5) return cache.struktur.foren;
   log('Lese die Liste der Foren ...');
   const cat = await get(CFG.category);
   const queue = [...cat.querySelectorAll('#page-body a.forumtitle, #page-body a.forumtitleUF')].map(a => ({ href: pfad(a.getAttribute('href')), name: a.textContent.trim(), archiv: false, ort: '' }));
@@ -139,20 +139,39 @@ async function sammeln() {
   if (!KOMPLETT) { try { cache = JSON.parse(fs.readFileSync(CACHE, 'utf8')); } catch (e) { cache = {}; } }
   if (cache.w !== CFG.woerter || cache.v !== 2) cache.themen = {};   /* andere Wortgrenze oder neue Zaehlweise: alles neu zaehlen */
   cache.w = CFG.woerter; cache.v = 2; cache.themen = cache.themen || {};
-  const foren = await struktur(cache);
-  const archivForen = Object.values(foren).filter(f => f.archiv);
-  log(Object.keys(foren).length + ' Foren, davon ' + archivForen.length + ' Szenenarchive');
+  let foren = await struktur(cache);
 
   // 1) Alle Themen im RPG-Bereich (Archive und laufende Szenen)
-  const themen = new Map(), archivIds = new Set();
-  for (const [fid, f] of Object.entries(foren)) {
-    if (f.ohne && !f.archiv) continue;
-    const hier = new Map();
-    for (const d of await alleSeiten(f.href, 'f')) themenAuf(d, hier);
-    hier.forEach((t, tid) => { if (themen.has(tid)) return; t.forum = +fid; t.archiv = f.archiv; t.ort = f.ort; themen.set(tid, t); if (f.archiv) archivIds.add(tid); });
+  /* Gibt es ein Forum aus der gemerkten Forenliste nicht mehr (HTTP 404, z. B. geloescht oder verschoben),
+     wird die Forenliste sofort neu gelesen und noch einmal begonnen, statt bis zu 24 Stunden lang abzubrechen. */
+  let themen, archivIds;
+  for (let runde = 0; ; runde++) {
+    log(Object.keys(foren).length + ' Foren, davon ' + Object.values(foren).filter(f => f.archiv).length + ' Szenenarchive');
+    themen = new Map(); archivIds = new Set();
+    try {
+      for (const [fid, f] of Object.entries(foren)) {
+        if (f.ohne && !f.archiv) continue;
+        const hier = new Map();
+        for (const d of await alleSeiten(f.href, 'f')) themenAuf(d, hier);
+        hier.forEach((t, tid) => { if (themen.has(tid)) return; t.forum = +fid; t.archiv = f.archiv; t.ort = f.ort; themen.set(tid, t); if (f.archiv) archivIds.add(tid); });
+      }
+      break;
+    } catch (e) {
+      if (e.status !== 404 || runde > 0) throw e;
+      log('Forum nicht mehr vorhanden (' + e.message + '). Lese die Forenliste neu ...');
+      foren = await struktur(cache, true);
+    }
   }
   const vorher = Object.keys(cache.themen).filter(tid => cache.themen[tid].ar).length;
-  if (!archivIds.size && vorher > 5) throw new Error('In den Archiven wurden keine Szenen gefunden, vorher waren es ' + vorher + '. Alter Stand bleibt stehen.');
+  /* Sicherung gegen einen blockierten Abruf: Archive ploetzlich leer? Dann bei bis zu drei der frueher archivierten Szenen nachsehen.
+     Gibt es die nicht mehr (HTTP 404, also geloescht), ist das leere Archiv echt und es geht weiter. */
+  if (!archivIds.size && vorher > 5) {
+    const frueher = Object.keys(cache.themen).filter(tid => cache.themen[tid].ar).slice(0, 3);
+    let weg = 0;
+    for (const tid of frueher) { try { await get('/t' + tid + '-'); } catch (e) { if (e.status === 404) weg++; } }
+    if (weg < frueher.length) throw new Error('In den Archiven wurden keine Szenen gefunden, vorher waren es ' + vorher + '. Alter Stand bleibt stehen.');
+    log('Die Archive sind leer: die frueher archivierten Szenen wurden geloescht.');
+  }
   /* Infothemen und angepinnte Themen sind keine Szenen; im Archiv zaehlt trotzdem alles (fuer die Beitragszahlen) */
   const szene = t => !t.fest && !CFG.ohneTitel.test(t.title);
   const lesen = [...themen].filter(([tid, t]) => t.archiv || szene(t));
@@ -168,9 +187,11 @@ async function sammeln() {
   Object.keys(cache.themen).forEach(tid => { if (!behalten.has(tid)) delete cache.themen[tid]; else cache.themen[tid].ar = archivIds.has(+tid) ? 1 : 0; });
 
   // Rufbuch: alle Zeilen mit Datum aus Beitraegen mit dem Rufbuch-Zeichen (1 = Beitrag vom Ersteller des Themas)
-  const ruf = [];
-  let starter = '';
-  for (const d of await alleSeiten(CFG.rufbuch, 't')) d.querySelectorAll('div[id^="p"]').forEach(p => {
+  let ruf = [];
+  let starter = '', rufDocs = null;
+  try { rufDocs = await alleSeiten(CFG.rufbuch, 't'); }
+  catch (e) { log('WARNUNG: Rufbuch nicht lesbar (' + e.message + '). Die Zeilen vom letzten Mal bleiben stehen.'); ruf = cache.ruf || []; rufDocs = []; }
+  for (const d of rufDocs) d.querySelectorAll('div[id^="p"]').forEach(p => {
     if (!/^p\d+$/.test(p.id)) return;
     const c = p.querySelector('.postbody .content') || p.querySelector('.content'); if (!c) return;
     const wer = autor(p); if (!starter) starter = wer;
@@ -180,10 +201,13 @@ async function sammeln() {
     text.split('\n').forEach(z => { if (/^\s*\d{1,2}\.\d{1,2}\.\d{2,4}\s*\|/.test(z)) ruf.push([z.trim(), wer === starter ? 1 : 0]); });
   });
   if (!ruf.length) log('Hinweis: Im Rufbuch wurden keine Zeilen gefunden.');
+  else if (rufDocs.length) cache.ruf = ruf;
 
   // 3) Trainingsbuecher
   const buecher = new Map();
-  for (const d of await alleSeiten(CFG.buecher, 'f')) themenAuf(d, buecher);
+  let buecherListe = null;
+  try { for (const d of await alleSeiten(CFG.buecher, 'f')) themenAuf(d, buecher); buecherListe = [...buecher.values()].map(b => [b.href, b.title, b.uid]); cache.buecher = buecherListe; }
+  catch (e) { log('WARNUNG: Trainingsbuecher nicht lesbar (' + e.message + '). Die Liste vom letzten Mal bleibt stehen.'); buecherListe = cache.buecher || []; }
 
   const daten = {
     v: 1, stand: Date.now(), w: CFG.woerter,
@@ -193,12 +217,19 @@ async function sammeln() {
     szenen: lesen.filter(([tid, t]) => szene(t) && !(foren[t.forum] || {}).ohne).map(([tid, t]) => [tid, t.title, t.ort || '', t.archiv ? 1 : 0, t.last || 0,
       Object.values((cache.themen[tid] || {}).p || {}).map(x => x[0])]).sort((a, b) => b[4] - a[4]),
     ruf,
-    buecher: [...buecher.values()].map(b => [b.href, b.title, b.uid])
+    buecher: buecherListe
   };
   return { cache, daten };
 }
 
-const { cache, daten } = await sammeln();
+let ergebnis;
+try { ergebnis = await sammeln(); }
+catch (e) {
+  console.log('::error title=Forumdaten::' + (e && e.message ? e.message : e));
+  log('ABBRUCH: ' + (e && e.stack ? e.stack : e));
+  process.exit(1);
+}
+const { cache, daten } = ergebnis;
 fs.writeFileSync(CACHE, JSON.stringify(cache));
 const json = JSON.stringify(daten).replace(/</g, '\\u003c').replace(/[\u007f-\uffff]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 fs.writeFileSync(OUT, '/* Automatisch erzeugt (GitHub Actions, stuendlich). Stand: ' + new Date(daten.stand).toLocaleString('de-DE') + '. Nicht von Hand bearbeiten. */\n'
